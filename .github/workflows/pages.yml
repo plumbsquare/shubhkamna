@@ -1,6 +1,20 @@
 name: 🚀 Deploy + Auto-Setup
 
-# हर push पर: test → prepare (URL/domain/ads inject) → GitHub Pages deploy
+# ══════════════════════════════════════════════════════════════
+#  ये workflow पूरा काम अपने आप करता है:
+#    1. अगर repo root में index.html नहीं है (सिर्फ़ .zip है) → zip खोलकर site तैयार
+#    2. 75 assertions वाला test suite चलाएगा (fail → deploy रुक जाएगा)
+#    3. असली site URL / CNAME / ad codes inject करेगा
+#    4. GitHub Pages पर deploy करेगा
+#
+#  Secrets (Settings → Secrets and variables → Actions):
+#    CUSTOM_DOMAIN   → shubhkamna.in     (CNAME + URLs उसी पर)
+#    ADSTERRA_SCRIPT → Adsterra loader code
+#    ADSENSE_CLIENT  → ca-pub-XXXXXXXXXXXXXXXX
+#    ADSENSE_SLOT    → ad slot id
+#    SITE_URL        → (optional) override
+# ══════════════════════════════════════════════════════════════
+
 on:
   push:
     branches: ["main", "master"]
@@ -16,63 +30,206 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # ---------- 1. टेस्ट (फेल हुआ तो deploy नहीं होगा) ----------
+  # ─────────── 1. Source तैयार करो (zip → site files) ───────────
+  source:
+    name: 📦 Source ready
+    runs-on: ubuntu-latest
+    outputs:
+      ready: ${{ steps.check.outputs.ready }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Zip में से site files निकालो (ज़रूरत हो तो)
+        id: check
+        run: |
+          set -e
+          if [ ! -f index.html ]; then
+            ZIP=$(ls -1 ./*.zip 2>/dev/null | head -1 || true)
+            if [ -n "$ZIP" ]; then
+              echo "index.html नहीं मिला — $ZIP से निकाल रहे हैं"
+              rm -rf _extract && mkdir -p _extract
+              unzip -q "$ZIP" -d _extract
+              INNER=$(find _extract -mindepth 1 -maxdepth 1 -type d | head -1 || true)
+              if [ -n "$INNER" ] && [ -f "$INNER/index.html" ]; then
+                echo "अंदर का folder: $INNER"
+                cp -r "$INNER"/. .
+              else
+                echo "zip flat है — सीधे copy"
+                cp -r _extract/. .
+              fi
+              rm -rf _extract
+              # hidden folder वापस सही जगह
+              if [ -d "_github" ]; then
+                mkdir -p .github
+                cp -r "_github"/. .github/ 2>/dev/null || true
+                rm -rf _github
+                echo "_github → .github ठीक किया"
+              fi
+            fi
+          fi
+          if [ -f index.html ]; then
+            echo "ready=true" >> $GITHUB_OUTPUT
+            echo "✅ site files ready"
+          else
+            echo "ready=false" >> $GITHUB_OUTPUT
+            echo "❌ site files नहीं मिलीं — repo में files upload करो"
+            ls -la
+            exit 1
+          fi
+
+      - name: Source को आगे बढ़ाओ
+        uses: actions/upload-artifact@v4
+        with:
+          name: site-source
+          path: .
+          include-hidden-files: true
+          retention-days: 1
+
+  # ─────────── 2. Test ───────────
   test:
-    name: ✅ Tests
+    name: 🧪 Tests
+    needs: source
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: site-source
+          path: site
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: '20'
 
       - name: Install test deps
-        working-directory: tests
+        working-directory: site/tests
         run: npm install --no-audit --no-fund
 
-      - name: Run full test suite
-        working-directory: tests
+      - name: Run full test suite (75 assertions)
+        working-directory: site/tests
         env:
-          ROOT_OVERRIDE: ${{ github.workspace }}
+          ROOT_OVERRIDE: ${{ github.workspace }}/site
         run: node fulltest.js
 
-  # ---------- 2. तैयारी + deploy ----------
+      - name: Tested source आगे बढ़ाओ
+        uses: actions/upload-artifact@v4
+        with:
+          name: site-ready
+          path: site
+          include-hidden-files: true
+          retention-days: 1
+
+  # ─────────── 3. Prepare + Deploy ───────────
   deploy:
     name: 🌐 Deploy to Pages
-    needs: test
+    needs: [source, test]
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: site-ready
+          path: site
 
-      - name: Setup Pages
-        uses: actions/configure-pages@v5
+      - uses: actions/configure-pages@v5
 
-      - name: Prepare site (real URL + domain + ad codes inject)
+      - name: Prepare — URL + CNAME + ad codes inject
+        working-directory: site
         env:
           CUSTOM_DOMAIN: ${{ secrets.CUSTOM_DOMAIN }}
           SITE_URL: ${{ secrets.SITE_URL }}
           ADSTERRA_SCRIPT: ${{ secrets.ADSTERRA_SCRIPT }}
           ADSENSE_CLIENT: ${{ secrets.ADSENSE_CLIENT }}
           ADSENSE_SLOT: ${{ secrets.ADSENSE_SLOT }}
-        run: python3 .github/prepare_site.py
+        run: |
+          python3 - <<'PY'
+          import os, re
+
+          ROOT = os.getcwd()
+          OWNER = os.environ.get("GITHUB_REPOSITORY_OWNER", "").strip()
+          REPO = (os.environ.get("GITHUB_REPOSITORY", "") or "").split("/")[-1].strip()
+          CUSTOM = (os.environ.get("CUSTOM_DOMAIN") or "").strip().strip("/")
+          SITE_SECRET = (os.environ.get("SITE_URL") or "").strip().rstrip("/")
+          ADSTERRA = (os.environ.get("ADSTERRA_SCRIPT") or "").strip()
+          ADC = (os.environ.get("ADSENSE_CLIENT") or "").strip()
+          ADS = (os.environ.get("ADSENSE_SLOT") or "").strip()
+
+          if SITE_SECRET:
+              site = SITE_SECRET + "/"
+          elif CUSTOM:
+              site = "https://" + CUSTOM + "/"
+          elif OWNER and REPO:
+              site = ("https://%s.github.io/" % OWNER) if REPO.lower() == (OWNER + ".github.io").lower() else ("https://%s.github.io/%s/" % (OWNER, REPO))
+          else:
+              site = "https://example.com/"
+
+          def read(p):
+              with open(p, encoding="utf-8") as f: return f.read()
+          def write(p, s):
+              with open(p, "w", encoding="utf-8") as f: f.write(s)
+
+          def sub_attr(pattern, value, s):
+              return re.sub(pattern, lambda m: m.group(1) + value + m.group(3), s, flags=re.I)
+
+          for name in ["index.html", "wish.html"]:
+              p = os.path.join(ROOT, name)
+              if not os.path.exists(p): continue
+              s = read(p); n = s
+              n = sub_attr(r'(<meta[^>]+property="og:url"[^>]+content=")([^"]*)(")', site, n)
+              n = sub_attr(r'(<meta[^>]+property="og:image"[^>]+content=")([^"]*)(")', site + "assets/img/og.jpg", n)
+              n = sub_attr(r'(<meta[^>]+property="og:image:secure_url"[^>]+content=")([^"]*)(")', site + "assets/img/og.jpg", n)
+              n = sub_attr(r'(<meta[^>]+name="twitter:image"[^>]+content=")([^"]*)(")', site + "assets/img/og.jpg", n)
+              n = sub_attr(r'(<link[^>]+rel="canonical"[^>]+href=")([^"]*)(")', site, n)
+              # AdSense block active करो
+              if ADC and ADS:
+                  def fix(m):
+                      blk = m.group(1)
+                      blk = blk.replace("ca-pub-XXXXXXXXXXXXXXXX", ADC)
+                      blk = blk.replace('data-ad-slot="XXXXXXXXXX"', 'data-ad-slot="%s"' % ADS)
+                      return blk
+                  n = re.sub(r"<!--\s*(<ins class=\"adsbygoogle\".*?</script>)\s*-->", fix, n, flags=re.S)
+              # Adsterra loader inject
+              if ADSTERRA:
+                  n = re.sub(r'<!--\s*(?:<!--\s*)?<script[^>]*profitablereliance[^>]*>\s*</script>\s*(?:-->)?\s*-->', lambda m: ADSTERRA, n, flags=re.I)
+              if n != s:
+                  write(p, n)
+
+          p = os.path.join(ROOT, "robots.txt")
+          if os.path.exists(p):
+              s = read(p)
+              n = re.sub(r'(?im)^(Sitemap:\s*)\S+', lambda m: m.group(1) + site + "sitemap.xml", s)
+              if n != s: write(p, n)
+
+          p = os.path.join(ROOT, "sitemap.xml")
+          if os.path.exists(p):
+              s = read(p)
+              n = re.sub(r'(?s)(<loc>)[^<]*(</loc>)', lambda m: m.group(1) + site + m.group(2), s)
+              if n != s: write(p, n)
+
+          if CUSTOM:
+              write(os.path.join(ROOT, "CNAME"), CUSTOM + "\n")
+
+          print("→ Site URL :", site)
+          print("→ CNAME    :", CUSTOM if CUSTOM else "(नहीं — CUSTOM_DOMAIN secret नहीं)")
+          print("→ Adsterra :", "inject हुआ" if ADSTERRA else "नहीं")
+          print("→ AdSense  :", "inject हुआ" if (ADC and ADS) else "नहीं")
+          print("→ तैयार ✅")
+          PY
+
+      - name: Deploy folder साफ़ करो
+        working-directory: site
+        run: |
+          rm -rf tests setup.sh setup.bat START-HERE.md UPLOAD-READ-ME.txt README.md \
+                 pages-workflow.yml pages-workflow.txt .git .github _github *.zip \
+                 assets/img/og-bg.jpg
+          echo "--- जो deploy हो रहा है ---"
+          find . -type f | sort
 
       - name: Upload static site
         uses: actions/upload-pages-artifact@v3
         with:
-          path: |
-            .
-            !tests
-            !setup.sh
-            !setup.bat
-            !START-HERE.md
-            !.git
+          path: site
 
       - name: Deploy
         id: deployment
@@ -84,10 +241,11 @@ jobs:
             echo "## 🎉 लाइव हो गया!"
             echo ""
             echo "- **Site:** ${{ steps.deployment.outputs.page_url }}"
-            echo "- **Deploy commit:** \`$(git rev-parse --short HEAD)\`"
+            echo "- **Tests:** 75/75 pass ✅"
             echo ""
             echo "### अगला कदम"
-            echo "1. Repo → **Settings → Pages** में custom domain डालो (अगर \$CUSTOM_DOMAIN secret सेट किया है तो यहाँ भी वही डालो)"
-            echo "2. **Secrets** में जाकर ये डाल सकते हो: \`CUSTOM_DOMAIN\`, \`ADSTERRA_SCRIPT\`, \`ADSENSE_CLIENT\`, \`ADSENSE_SLOT\`"
-            echo "3. हर push पर अपने आप deploy + test होगा"
+            echo "1. **Settings → Secrets and variables → Actions** में डाल सकते हो:"
+            echo "   \`CUSTOM_DOMAIN\`, \`ADSTERRA_SCRIPT\`, \`ADSENSE_CLIENT\`, \`ADSENSE_SLOT\`"
+            echo "2. Secret बदलते ही अगला push उन्हें inject कर देगा (कोई code छूने की ज़रूरत नहीं)"
+            echo "3. हर push पर: test → prepare → deploy अपने आप"
           } >> $GITHUB_STEP_SUMMARY
