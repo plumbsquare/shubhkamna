@@ -1,0 +1,93 @@
+name: 🚀 Deploy + Auto-Setup
+
+# हर push पर: test → prepare (URL/domain/ads inject) → GitHub Pages deploy
+on:
+  push:
+    branches: ["main", "master"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  # ---------- 1. टेस्ट (फेल हुआ तो deploy नहीं होगा) ----------
+  test:
+    name: ✅ Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install test deps
+        working-directory: tests
+        run: npm install --no-audit --no-fund
+
+      - name: Run full test suite
+        working-directory: tests
+        env:
+          ROOT_OVERRIDE: ${{ github.workspace }}
+        run: node fulltest.js
+
+  # ---------- 2. तैयारी + deploy ----------
+  deploy:
+    name: 🌐 Deploy to Pages
+    needs: test
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Prepare site (real URL + domain + ad codes inject)
+        env:
+          CUSTOM_DOMAIN: ${{ secrets.CUSTOM_DOMAIN }}
+          SITE_URL: ${{ secrets.SITE_URL }}
+          ADSTERRA_SCRIPT: ${{ secrets.ADSTERRA_SCRIPT }}
+          ADSENSE_CLIENT: ${{ secrets.ADSENSE_CLIENT }}
+          ADSENSE_SLOT: ${{ secrets.ADSENSE_SLOT }}
+        run: python3 .github/prepare_site.py
+
+      - name: Upload static site
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: |
+            .
+            !tests
+            !setup.sh
+            !setup.bat
+            !START-HERE.md
+            !.git
+
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Summary
+        run: |
+          {
+            echo "## 🎉 लाइव हो गया!"
+            echo ""
+            echo "- **Site:** ${{ steps.deployment.outputs.page_url }}"
+            echo "- **Deploy commit:** \`$(git rev-parse --short HEAD)\`"
+            echo ""
+            echo "### अगला कदम"
+            echo "1. Repo → **Settings → Pages** में custom domain डालो (अगर \$CUSTOM_DOMAIN secret सेट किया है तो यहाँ भी वही डालो)"
+            echo "2. **Secrets** में जाकर ये डाल सकते हो: \`CUSTOM_DOMAIN\`, \`ADSTERRA_SCRIPT\`, \`ADSENSE_CLIENT\`, \`ADSENSE_SLOT\`"
+            echo "3. हर push पर अपने आप deploy + test होगा"
+          } >> $GITHUB_STEP_SUMMARY
